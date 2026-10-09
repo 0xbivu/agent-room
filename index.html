@@ -1,0 +1,441 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Room</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;800&display=swap">
+<style>
+  :root { color-scheme:dark;
+          --bg:#07090a; --panel:#0c1110; --panel2:#101716; --fg:#cfe9d8; --muted:#5d7468; --line:#1a2622;
+          --glow:#39ff88; --user:#7aa2ff; --claude:#ffb454; --codex:#5af78e; --agy:#c792ea; --other:#57c7ff;
+          --room:#ff5c57; --warn:#ffcc4d;
+          --mono:"JetBrains Mono", ui-monospace, "Cascadia Code", "Fira Code", Menlo, Consolas, monospace; }
+  * { box-sizing:border-box; }
+  html, body { height:100%; }
+  body { margin:0; background:radial-gradient(ellipse at top, #0d1a14 0%, var(--bg) 60%) fixed; color:var(--fg);
+         font:14px/1.55 var(--mono); display:flex; flex-direction:column; height:100vh; height:100dvh; }
+  body::after { content:""; position:fixed; inset:0; pointer-events:none; z-index:9;  /* CRT scanlines */
+                background:repeating-linear-gradient(0deg, #0000 0 2px, #0003 2px 3px); mix-blend-mode:multiply; }
+  ::selection { background:var(--glow); color:#000; }
+  ::-webkit-scrollbar { width:8px; } ::-webkit-scrollbar-thumb { background:var(--line); }
+
+  /* title bar + status line, tmux style */
+  header { border-bottom:1px solid var(--line); background:var(--panel); }
+  .bar { display:flex; align-items:center; gap:10px; padding:8px 16px; min-width:0; }
+  .dots { display:flex; gap:6px; flex:none; } .dots i { width:11px; height:11px; border-radius:50%; display:block; }
+  .dots i:nth-child(1) { background:#ff5f57; } .dots i:nth-child(2) { background:#febc2e; } .dots i:nth-child(3) { background:#28c840; }
+  .title { font-weight:800; letter-spacing:.08em; color:var(--glow); text-shadow:0 0 8px #39ff8866; white-space:nowrap; }
+  .title::before { content:"▍"; animation:blink 1.1s steps(1) infinite; margin-right:4px; }
+  .hint { color:var(--muted); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+  .hint kbd { color:var(--fg); border:1px solid var(--line); padding:0 4px; font:inherit; }
+  #connection { margin-left:auto; flex:none; font-size:11px; color:var(--warn); white-space:nowrap; }
+  #connection[data-online="true"] { color:var(--glow); }
+  @keyframes blink { 50% { opacity:0; } }
+  #agents { display:flex; flex-wrap:wrap; gap:6px; padding:6px 16px 8px; border-top:1px dashed var(--line); min-width:0; }
+  #agents:empty::before { content:"[ waiting for agents… ]"; color:var(--muted); }
+  .agent-chip { display:flex; flex-wrap:wrap; align-items:center; gap:6px; max-width:100%; min-width:0; padding:2px 8px;
+                background:var(--panel2); border:1px solid var(--line); border-left:3px solid var(--c); }
+  .agent-chip b { min-width:0; overflow-wrap:anywhere; color:var(--c); text-shadow:0 0 6px color-mix(in srgb, var(--c) 45%, transparent); }
+  .agent-chip b::before { content:"● "; font-size:10px; vertical-align:1px; }
+  .agent-chip > span { min-width:0; overflow-wrap:anywhere; color:var(--muted); font-size:12px; }
+  .agent-chip select { min-width:0; max-width:100%; flex:1 1 140px; font:12px var(--mono); color:var(--fg); cursor:pointer;
+                       background:var(--bg); border:1px solid var(--line); padding:1px 4px; }
+  .agent-chip select:focus { outline:1px solid var(--glow); }
+  .agent-chip .approval { color:#000; background:var(--warn); padding:0 6px; font-size:11px; font-weight:800;
+                          animation:blink 1s steps(1) infinite; }
+
+  /* the log */
+  #log { flex:1; min-height:0; overflow-y:auto; padding:12px 16px 20px; }
+  .m { max-width:1100px; margin:0 auto; padding:5px 10px; border-left:2px solid transparent; }
+  .m:hover { background:#ffffff06; border-left-color:var(--c); }
+  .h { color:var(--muted); font-size:12px; overflow-wrap:anywhere; }
+  .h b { color:var(--c); font-size:14px; text-shadow:0 0 6px color-mix(in srgb, var(--c) 40%, transparent); }
+  .h b::before { content:"❯ "; color:var(--muted); text-shadow:none; }
+  .h .id { opacity:.6; }
+  .t { white-space:pre-wrap; overflow-wrap:anywhere; padding-left:18px; }
+  .t a { color:var(--other); text-underline-offset:3px; }
+  .t code { font:inherit; color:var(--glow); background:var(--panel2); padding:1px 4px; }
+  .code-block { position:relative; margin:8px 0; white-space:normal; border:1px solid var(--line); background:var(--bg); }
+  .code-block pre { margin:0; padding:32px 12px 12px; overflow-x:auto; white-space:pre; }
+  .code-block code { padding:0; background:none; color:var(--fg); }
+  .copy, .more { font:12px var(--mono); color:var(--muted); background:var(--panel); border:1px solid var(--line); cursor:pointer; }
+  .copy { position:absolute; top:5px; right:8px; padding:1px 6px; }
+  .more { margin:6px 0 0 18px; padding:3px 8px; color:var(--glow); }
+  .t.collapsed { max-height:calc(25 * 1.55 * 14px); overflow:hidden; }
+  :focus-visible { outline:2px solid var(--glow); outline-offset:2px; }
+  .at { font-weight:600; }
+  .m.system { border-left-color:var(--line); background:#8fb3a505; }
+  .m.system .t { color:#8fb3a5; }
+  .m.system .h b { font-size:12px; text-shadow:none; }
+  .m.system .h b::before { content:"· "; }
+
+  /* permission requests */
+  .ask { margin:10px auto; border:1px solid var(--warn); border-left:4px solid var(--warn); background:#1a1606;
+         box-shadow:0 0 0 1px #000, 0 0 18px #ffcc4d22; }
+  .ask .h b { color:var(--warn); }
+  .ask .h::after { content:"  ⚠ AWAITING APPROVAL"; color:var(--warn); font-weight:800; animation:blink 1.2s steps(1) infinite; }
+  .ask .t { color:#f3e3b0; }
+  .ask .btns { margin:8px 0 4px 18px; display:flex; gap:8px; flex-wrap:wrap; }
+  .ask button { padding:4px 12px; font:13px var(--mono); background:transparent; color:var(--glow);
+                border:1px solid var(--glow); border-radius:0; cursor:pointer; text-align:left; max-width:100%; overflow-wrap:anywhere; }
+  .ask button:hover, .ask button:focus-visible { background:var(--glow); color:#000; outline:none; }
+  .ask button.no { color:var(--room); border-color:var(--room); }
+  .ask button.no:hover { background:var(--room); color:#000; }
+  .ask.done { opacity:.45; box-shadow:none; } .ask.done .btns { display:none; }
+  .ask.done .h::after { content:"  ✓ answered"; animation:none; color:var(--glow); }
+
+  /* prompt */
+  form { display:flex; align-items:flex-start; gap:10px; padding:10px 16px 14px; border-top:1px solid var(--line); background:var(--panel); }
+  .ps1 { flex:none; padding-top:7px; white-space:nowrap; font-weight:600; }
+  .ps1 .u { color:var(--user); } .ps1 .p { color:var(--glow); }
+  .compose { position:relative; flex:1; min-width:0; }
+  textarea { display:block; width:100%; resize:none; height:58px; font:14px/1.55 var(--mono); padding:6px 8px;
+             background:var(--bg); color:var(--fg); caret-color:var(--glow); border:1px solid var(--line); border-radius:0; }
+  textarea:focus { outline:none; border-color:var(--glow); box-shadow:0 0 0 1px #39ff8833, 0 0 14px #39ff8822; }
+  textarea::placeholder { color:var(--muted); }
+  form > button { align-self:stretch; padding:0 16px; font:600 13px var(--mono); border-radius:0; cursor:pointer;
+                  background:transparent; color:var(--glow); border:1px solid var(--glow); }
+  form > button:hover { background:var(--glow); color:#000; }
+
+  /* completion menu, shell style */
+  #suggestions { position:absolute; bottom:calc(100% + 6px); left:0; right:0; z-index:5; max-height:min(300px, 45vh);
+                 overflow-y:auto; background:#050807; border:1px solid var(--glow); box-shadow:0 0 22px #39ff8826; }
+  .suggestion { display:flex; gap:12px; align-items:baseline; padding:4px 10px; cursor:pointer; overflow-wrap:anywhere; }
+  .suggestion b { color:var(--fg); font-weight:600; white-space:nowrap; }
+  .suggestion small { color:var(--muted); font-size:12px; }
+  .suggestion[aria-selected="true"] { background:var(--glow); }
+  .suggestion[aria-selected="true"] b, .suggestion[aria-selected="true"] small { color:#000; }
+
+  @media (max-width:600px) {
+    .hint { display:none; }
+    .ps1 { display:none; }
+    .suggestion { flex-direction:column; gap:0; }
+    .suggestion b { white-space:normal; }
+    .agent-chip { width:100%; }
+    form > button { padding:0 10px; }
+    .m { padding-left:0; padding-right:0; }
+    .t { padding-left:10px; }
+    .more { margin-left:10px; }
+  }
+  @media (prefers-reduced-motion:reduce) {
+    *, *::before, *::after { animation:none !important; }
+    body::after { display:none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="bar"><div class="dots" aria-hidden="true"><i></i><i></i><i></i></div>
+    <span class="title">AGENT_ROOM</span>
+    <span class="hint"><kbd>@</kbd> mention · <kbd>/</kbd> commands · no mention → claude (manager) · approvals: click or type the number</span>
+    <span id="connection" role="status" data-online="false">connecting…</span></div>
+  <div id="agents" aria-label="Agents"></div>
+</header>
+<div id="log"></div>
+<form id="f"><span class="ps1" aria-hidden="true"><span class="u">user</span>@room<span class="p">:~$</span></span><div class="compose"><div id="suggestions" role="listbox" aria-label="Suggestions" hidden></div><textarea id="in" aria-label="Message the team" placeholder="type a message, @ to mention, / for commands" aria-autocomplete="list" aria-controls="suggestions" aria-expanded="false"></textarea></div><button>⏎ send</button></form>
+<script>
+const log = document.getElementById('log'), inp = document.getElementById('in');
+const known = ['user', 'claude', 'codex', 'agy', 'room'];
+const color = n => `var(--${known.includes(n) ? n : 'other'})`;
+const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;'}[c]));
+function renderText(text) {
+  const escaped = esc(text);
+  const inline = value => value.replace(/`([^`\n]+)`|https?:\/\/(?:(?!&(?:lt|gt|quot);)[^\s`])+|@([\w-]+)/g, (match, code, mention) => {
+    if (code !== undefined) return `<code>${code}</code>`;
+    if (mention !== undefined) return `<span class="at" style="color:${color(mention.toLowerCase())}">${match}</span>`;
+    let url = match.replace(/[.,!?:]+$/, '');
+    while (/[)\]}]$/.test(url)) {
+      const close = url.at(-1), open = {')':'(', ']':'[', '}':'{'}[close];
+      if (url.split(close).length <= url.split(open).length) break;
+      url = url.slice(0, -1);
+    }
+    return `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>${match.slice(url.length)}`;
+  });
+  let html = '', start = 0;
+  for (const fence of escaped.matchAll(/^```[^\n]*\n([\s\S]*?)^```[ \t]*(?:\n|$)/gm)) {
+    html += inline(escaped.slice(start, fence.index));
+    html += `<div class="code-block"><button type="button" class="copy" aria-label="Copy code">copy</button><pre><code>${fence[1]}</code></pre></div>`;
+    start = fence.index + fence[0].length;
+  }
+  return html + inline(escaped.slice(start));
+}
+let last = 0, unread = 0, loaded = false;
+function updateTitle() {
+  const waiting = document.querySelectorAll('.ask:not(.done)').length;
+  document.title = waiting ? `🔐 (${waiting}) approval needed · Agent Room` : (unread ? `(${unread}) Agent Room` : 'Agent Room');
+}
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) unread = 0;
+  updateTitle();
+});
+log.addEventListener('click', async e => {
+  const button = e.target.closest('.copy');
+  if (!button) return;
+  try {
+    await navigator.clipboard.writeText(button.closest('.code-block').querySelector('code').textContent);
+    button.textContent = 'copied';
+  } catch (error) { button.textContent = 'copy failed'; }
+  setTimeout(() => { button.textContent = 'copy'; }, 2000);
+});
+function add(m) {
+  if (m.from === 'room' && m.reset) { log.replaceChildren(); unread = 0; }
+  const d = document.createElement('div');
+  d.className = 'm'; d.style.setProperty('--c', color(m.from));
+  d.innerHTML = `<div class="h">[${new Date(m.ts * 1000).toLocaleTimeString([], {hour12: false})}] <b>${esc(m.from)}</b> <span class="id">#${esc(String(m.id))}</span></div><div class="t">${renderText(m.text)}</div>`;
+  const body = d.querySelector('.t'); body.id = 'message-' + m.id;
+  if (m.text.split('\n').length > 25) {
+    body.classList.add('collapsed');
+    const more = document.createElement('button'); more.type = 'button'; more.className = 'more';
+    more.textContent = '▾ show more'; more.setAttribute('aria-expanded', 'false'); more.setAttribute('aria-controls', body.id);
+    more.onclick = () => {
+      const collapsed = body.classList.toggle('collapsed');
+      more.textContent = collapsed ? '▾ show more' : '▴ show less';
+      more.setAttribute('aria-expanded', String(!collapsed));
+    };
+    body.addEventListener('focusin', () => { if (body.classList.contains('collapsed')) more.click(); });
+    d.appendChild(more);
+  }
+  log.appendChild(d);
+  const ask = m.from === 'room' && m.text.match(/^🔐 (\S+) needs/);
+  const done = m.from === 'room' && m.text.match(/^✅ (\S+):/);
+  if (m.from === 'room' && !ask) { d.classList.add('system'); d.style.setProperty('--c', '#8fb3a5'); }
+  if (ask) {
+    d.classList.add('ask'); d.dataset.agent = ask[1];
+    if (m.replay) d.classList.add('done');
+    // one button per option listed in the request ("   2 = Yes, and don't ask again"), plus Deny
+    const opts = [...m.text.matchAll(/^   (\d+) = (.+)$/gm)];
+    const btns = document.createElement('div'); btns.className = 'btns';
+    for (const [, n, label] of opts) {
+      const b = document.createElement('button'); b.textContent = `[${n}] ${label}`;
+      b.onclick = () => send(n + ' ' + ask[1]); btns.appendChild(b);
+    }
+    const no = document.createElement('button'); no.textContent = '[n] Deny'; no.className = 'no';
+    no.onclick = () => send('n ' + ask[1]); btns.appendChild(no);
+    d.appendChild(btns);
+  }
+  if (done) document.querySelectorAll('.ask').forEach(c => { if (c.dataset.agent === done[1]) c.classList.add('done'); });
+}
+const send = text => fetch('/messages', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({from: 'user', text})});
+const chips = document.getElementById('agents'), popup = document.getElementById('suggestions');
+let state = {agents: [], models: {}, efforts: {}, commands: [], sessions: []}, chipState = '';
+let completion = null, selected = 0, dismissed = null;
+const strings = values => Array.isArray(values) ? values.filter(v => typeof v === 'string') : [];
+function renderAgents() {
+  const signature = JSON.stringify([state.agents, state.models, state.efforts]);
+  if (signature === chipState) return;
+  chipState = signature;
+  chips.replaceChildren();
+  for (const agent of state.agents) {
+    const chip = document.createElement('div'); chip.className = 'agent-chip';
+    chip.style.setProperty('--c', color(agent.kind));
+    const name = document.createElement('b'); name.textContent = agent.name;
+    const kind = document.createElement('span'); kind.textContent = agent.kind || '';
+    const select = document.createElement('select');
+    select.setAttribute('aria-label', `Model for ${agent.name}`);
+    const [model = '', effort = ''] = (typeof agent.model === 'string' ? agent.model.trim() : '').split(/\s+/);
+    const models = [...new Set([...strings(state.models[agent.kind]), ...(model ? [model] : [])])];
+    if (!model) {
+      const option = document.createElement('option'); option.value = ''; option.textContent = 'Choose model…';
+      option.disabled = true; option.selected = true; select.appendChild(option);
+    }
+    for (const value of models) {
+      const option = document.createElement('option'); option.value = value; option.textContent = value;
+      option.selected = value === model; select.appendChild(option);
+    }
+    select.disabled = !models.length;
+    select.title = agent.model || 'Choose model';
+    select.onchange = async () => {
+      select.disabled = true;
+      try {
+        const response = await send(['/model', agent.name, select.value, effortSel.value].filter(Boolean).join(' '));
+        if (!response.ok) throw new Error('Model change failed');
+      } catch (e) {
+        select.value = model;
+        alert('Could not send the model change. Try again.');
+      } finally { select.disabled = false; }
+    };
+    // reasoning effort picker: changing it restarts the agent on the same model with the new effort
+    const effortSel = document.createElement('select');
+    effortSel.setAttribute('aria-label', `Reasoning effort for ${agent.name}`);
+    effortSel.title = 'reasoning effort';
+    for (const value of ['', ...strings(state.efforts[agent.kind])]) {
+      const option = document.createElement('option'); option.value = value;
+      option.textContent = value ? 'effort ' + value : 'effort default';
+      option.selected = value === effort; effortSel.appendChild(option);
+    }
+    effortSel.onchange = async () => {
+      effortSel.disabled = true;
+      try {
+        const response = await send(['/model', agent.name, model || select.value, effortSel.value].filter(Boolean).join(' '));
+        if (!response.ok) throw new Error('Effort change failed');
+      } catch (e) {
+        effortSel.value = effort;
+        alert('Could not send the effort change. Try again.');
+      } finally { effortSel.disabled = false; }
+    };
+    chip.append(name, kind, select, effortSel);
+    if (agent.asking) {
+      const badge = document.createElement('span'); badge.className = 'approval';
+      badge.textContent = 'needs approval'; chip.appendChild(badge);
+    }
+    chips.appendChild(chip);
+  }
+}
+function getCompletion(value, caret) {
+  const left = value.slice(0, caret);
+  const mention = left.match(/(?:^|\s)@([\w-]*)$/);
+  const agents = state.agents.map(a => ({value: a.name, label: a.name,
+    detail: [a.kind, a.model, a.asking ? 'needs approval' : ''].filter(Boolean).join(' · ')}));
+  let start = caret, end = caret, items = [];
+  if (mention) {
+    start = caret - mention[1].length - 1;
+    end += value.slice(caret).match(/^[\w-]*/)[0].length;
+    items = [...agents, {value: 'all', label: 'all', detail: 'every agent'}, {value: 'everyone', label: 'everyone', detail: 'every agent'}]
+      .map(a => ({...a, value: '@' + a.value, label: '@' + a.label}));
+  } else {
+    if (!value.startsWith('/')) return null;
+    while (start > 0 && !/\s/.test(value[start - 1])) start--;
+    while (end < value.length && !/\s/.test(value[end])) end++;
+    const before = value.slice(0, start).trim();
+    if (!before) {
+      items = state.commands.map(c => ({value: c.cmd, label: [c.cmd, c.args].filter(Boolean).join(' '), detail: c.desc || ''}));
+    } else {
+      const tokens = before.split(/\s+/), arg = tokens.length - 1;
+      const kind = tokens[0] === '/spawn' ? tokens[2] : state.agents.find(a => a.name === tokens[1])?.kind;
+      let values = [];
+      if ((tokens[0] === '/model' && arg === 0) || (['/kill', '/approve', '/deny'].includes(tokens[0]) && arg === 0)) {
+        items = agents;
+        if (tokens[0] !== '/model' && tokens[0] !== '/kill') {
+          items = state.agents.map((a, i) => ({...agents[i], asking: !!a.asking}))
+            .sort((a, b) => Number(b.asking) - Number(a.asking));
+        }
+      } else if ((tokens[0] === '/model' && arg === 1) || (tokens[0] === '/spawn' && arg === 2)) {
+        values = strings(state.models[kind]);
+      } else if ((tokens[0] === '/model' && arg === 2) || (tokens[0] === '/spawn' && arg === 3)) {
+        values = strings(state.efforts[kind]);
+      } else if (tokens[0] === '/spawn' && arg === 1) {
+        values = ['claude', 'codex', 'agy'];
+      } else if (['/send', '/key', '/peek'].includes(tokens[0]) && arg === 0) {
+        items = agents;
+      } else if (tokens[0] === '/send' && arg === 1) {
+        values = strings(state.native?.[kind]);
+      } else if (tokens[0] === '/auto' && arg === 0) {
+        values = ['on', 'off'];
+      } else if (tokens[0] === '/resume' && arg === 0) {
+        items = state.sessions.map(s => ({value: s.id, label: s.id,
+          detail: [s.current ? 'current' : '', s.title].filter(Boolean).join(' · ')}));
+      }
+      if (values.length) items = values.map(v => ({value: v, label: v, detail: ''}));
+    }
+  }
+  const prefix = value.slice(start, caret).toLowerCase();
+  items = items.filter(item => item.value.toLowerCase().startsWith(prefix));
+  return items.length ? {start, end, items} : null;
+}
+function closeSuggestions() {
+  popup.hidden = true; completion = null;
+  inp.setAttribute('aria-expanded', 'false'); inp.removeAttribute('aria-activedescendant');
+}
+function selectSuggestion(index) {
+  selected = index;
+  [...popup.children].forEach((row, i) => row.setAttribute('aria-selected', String(i === selected)));
+  inp.setAttribute('aria-activedescendant', 'suggestion-' + selected);
+  popup.children[selected]?.scrollIntoView({block: 'nearest'});
+}
+function refreshSuggestions() {
+  const key = inp.value + '\0' + inp.selectionStart;
+  if (document.activeElement !== inp || inp.selectionStart !== inp.selectionEnd || dismissed === key) {
+    closeSuggestions(); return;
+  }
+  const previous = completion?.items[selected]?.value;
+  completion = getCompletion(inp.value, inp.selectionStart);
+  if (!completion) { closeSuggestions(); return; }
+  popup.replaceChildren();
+  completion.items.forEach((item, i) => {
+    const row = document.createElement('div'); row.className = 'suggestion';
+    row.id = 'suggestion-' + i; row.dataset.index = i; row.setAttribute('role', 'option');
+    const label = document.createElement('b'); label.textContent = item.label; row.appendChild(label);
+    if (item.detail) { const detail = document.createElement('small'); detail.textContent = item.detail; row.appendChild(detail); }
+    popup.appendChild(row);
+  });
+  popup.hidden = false; inp.setAttribute('aria-expanded', 'true');
+  selectSuggestion(Math.max(0, completion.items.findIndex(item => item.value === previous)));
+}
+function acceptSuggestion() {
+  if (!completion) return;
+  const {start, end, items} = completion;
+  inp.setRangeText(items[selected].value + ' ', start, end + (inp.value[end] === ' ' ? 1 : 0), 'end');
+  dismissed = null;
+  inp.focus(); refreshSuggestions();
+}
+popup.onmousedown = e => e.preventDefault();
+popup.onclick = e => {
+  const row = e.target.closest('[data-index]');
+  if (row && completion) { selected = Number(row.dataset.index); acceptSuggestion(); }
+};
+inp.oninput = () => { dismissed = null; refreshSuggestions(); };
+inp.onfocus = refreshSuggestions;
+inp.onclick = refreshSuggestions;
+inp.onblur = closeSuggestions;
+inp.onkeyup = e => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) refreshSuggestions(); };
+async function pollState() {
+  try {
+    const response = await fetch('/state');
+    if (!response.ok) throw new Error('State unavailable');
+    const next = await response.json();
+    state = {
+      agents: Array.isArray(next?.agents) ? next.agents.filter(a => a && typeof a.name === 'string') : [],
+      models: next?.models || {}, efforts: next?.efforts || {}, native: next?.native || {},
+      sessions: Array.isArray(next?.sessions) ? next.sessions.filter(s => s && typeof s.id === 'string') : [],
+      commands: Array.isArray(next?.commands) ? next.commands.filter(c => c && typeof c.cmd === 'string') : []
+    };
+    renderAgents(); refreshSuggestions();
+  } catch (e) {}
+  setTimeout(pollState, 3000);
+}
+async function poll() {
+  const connection = document.getElementById('connection');
+  try {
+    const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+    const response = await fetch('/messages?since=' + last);
+    if (!response.ok) throw new Error('Messages unavailable');
+    const ms = await response.json();
+    if (ms.length && ms[0].id <= last) { log.innerHTML = ''; unread = 0; }
+    ms.forEach(m => { add(m); last = m.id; });
+    if (document.hidden && loaded) unread += ms.length;
+    loaded = true; updateTitle();
+    if (connection.dataset.online !== 'true') { connection.textContent = '● online'; connection.dataset.online = 'true'; }
+    if (ms.length && atBottom) log.scrollTop = log.scrollHeight;
+  } catch (e) {
+    if (connection.textContent !== '○ reconnecting…') { connection.textContent = '○ reconnecting…'; connection.dataset.online = 'false'; }
+  }
+  setTimeout(poll, 1000);
+}
+document.getElementById('f').onsubmit = async e => {
+  e.preventDefault();
+  const text = inp.value.trim(); if (!text) return;
+  inp.value = '';
+  closeSuggestions(); dismissed = null;
+  await send(text);
+};
+inp.onkeydown = e => {
+  if (e.isComposing) return;
+  if (completion && !popup.hidden) {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      selectSuggestion((selected + (e.key === 'ArrowDown' ? 1 : -1) + completion.items.length) % completion.items.length);
+      return;
+    }
+    if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); acceptSuggestion(); return; }
+    if (e.key === 'Escape') {
+      e.preventDefault(); dismissed = inp.value + '\0' + inp.selectionStart; closeSuggestions(); return;
+    }
+  }
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); document.getElementById('f').requestSubmit(); }
+};
+poll(); pollState();
+</script>
+</body>
+</html>

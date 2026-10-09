@@ -1,0 +1,8 @@
+# runtime state: chat history, sessions, preferences
+data/
+# agents' shared working dir (keep only its project settings)
+workspace/*
+!workspace/.claude/
+workspace/.claude/*
+!workspace/.claude/settings.json
+__pycache__/

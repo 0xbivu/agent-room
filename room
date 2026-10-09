@@ -1,0 +1,987 @@
+#!/usr/bin/env python3
+"""Agent room: a shared chat where claude (manager), codex, agy and any spawned helpers work as a team.
+  room                    start everything that isn't running and attach to the tmux session
+  room up                 start everything that isn't running (server, tmux session 'room', router)
+  room down               stop everything (also: Ctrl-C in the main chat pane)
+  room chat               chat as $ROOM_NAME (default 'user'); /commands work inside (and in the browser)
+  room say [TEXT]         post a message (TEXT, or stdin if omitted)
+  room log [N]            print the last N messages (default 30)
+  room who                list running agents
+  room spawn NAME KIND [MODEL [EFFORT]]  start a new agent (KIND: claude|codex|agy) in its own tmux window
+  room model NAME MODEL [EFFORT]          restart an agent on another model (it catches up from the chat)
+  room models             list the models each CLI offers
+  room approve NAME [N]   answer an agent's permission prompt with option N (default 1 = yes)
+  room deny NAME          reject an agent's permission prompt
+  room send NAME TEXT...  type text or a CLI slash command into an agent and press Enter
+  room key NAME KEY...    send allowed keys to an agent's picker/menu
+  room peek NAME [N]     show the last N non-empty pane lines (default 30, max 120)
+  room kill NAME          stop an agent (core agents claude/codex/agy get restarted by the router)
+  room sessions           list saved room sessions (current session marked *)
+  room resume ID          restore a room session and each agent's own CLI conversation
+  room new                start a new room session with fresh core agents and empty chat
+  room clear              archive and clear the current room session's chat
+  room fresh              clear chat and start fresh CLI conversations in the same room session
+  room router             deliver messages into agent panes, keep core agents alive (started by `up`)
+  room intro NAME KIND    print an agent's onboarding prompt (used at spawn)"""
+import contextlib, datetime, fcntl, glob, io, json, os, re, shlex, signal, sqlite3, subprocess, sys, threading, time, urllib.request, uuid
+
+DIR = os.path.dirname(os.path.realpath(__file__))
+WS = os.path.join(DIR, "workspace")
+ROOM = os.environ.get("ROOM", "http://127.0.0.1:9090")
+ME = os.environ.get("ROOM_NAME", "user")
+CORE = ("claude", "codex", "agy")
+HOME = os.path.expanduser("~")
+SESSIONS = os.path.join(DIR, "data", "sessions")
+# Factory fallback only; /model NAME MODEL [EFFORT] saves the user's choices across room sessions.
+DEFAULTS = {"claude": ("opus", "xhigh"), "codex": ("gpt-6.1-sol", "xhigh"), "agy": ("gemini-3.8-flash-high", "")}
+
+
+def cli(kind, model, effort, conversation="", resume=False):
+    """Launch command. Auto modes: safe actions run on their own, risky ones ask you (shown in the chat).
+    --add-dir gives every agent access to your whole home folder, not just the workspace."""
+    e = lambda flag: f" {flag}{shlex.quote(effort)}" if effort else ""
+    if conversation:
+        conversation = str(uuid.UUID(conversation))
+    return {
+        "claude": f"claude --model {shlex.quote(model)}{e('--effort ')} --dangerously-skip-permissions --add-dir {shlex.quote(HOME)}"
+                  + (f" --{'resume' if resume else 'session-id'} {conversation}" if conversation else ""),
+        "codex": f"codex{' resume' if resume else ''} --no-daemon -m {shlex.quote(model)}{e('-c model_reasoning_effort=')} --dangerously-bypass-approvals-and-sandbox --add-dir {shlex.quote(HOME)}"
+                 + (f" {conversation}" if resume else ""),
+        "agy": f"agy --model {shlex.quote(model)}{e('--effort ')} --dangerously-skip-permissions --add-dir {shlex.quote(HOME)}"
+               + (f" --conversation {conversation}" if resume else "") + " -i",  # auto-approve, like claude/codex
+    }[kind]
+# don't leak a parent Claude Code session's env into the agents we start
+ENV = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE") and k != "AI_AGENT"}
+ENV["PATH"] = DIR + ":" + ENV["PATH"]
+COLORS = {"user": 34, "claude": 33, "codex": 32, "agy": 35, "room": 31}
+CATCHUP, CATCHUP_CHARS = 25, 1500  # ponytail: last 25 missed messages, 1500 chars each; agents can `room log` for more
+MAX_AGENT_HOPS = 40  # ponytail: crude runaway-loop guard; agent-to-agent delivery pauses until the user posts
+WARMUP = 20          # ponytail: fixed seconds before a new pane gets messages; detect the input box if this flakes
+# a permission/menu dialog is open: typing Enter there would answer it, so hold messages until it closes
+DIALOG = re.compile(r"(?mi)^[ \t]*[❯›>]\s*\d+\.\s|\(y/n\)[ \t]*$|^[ \t]*(?:press[ \t]+)?enter to confirm[ \t]*$")  # real menu / y-n / confirm line, not footer/prose
+SETUP_NAG = re.compile(r"Teach auto mode about your environment\?", re.I)
+
+INTRO = """You are @{name} ({kind} CLI) in a live multi-agent team room, working with other AI agents. \
+The human @user watches everything, assigns work, approves permissions, and may type to you directly.
+Core members: @claude (manager), @codex, @agy. More helpers may be spawned; `room who` lists everyone.
+- Room messages arrive in your input as: [room #ID] sender: text
+- IMPORTANT: text you write in your own session is invisible to everyone else. The ONLY way the user or \
+other agents see your reply is: room say "message"   (long/multi-line: room say <<'EOF' ... EOF)
+- @mention who should act (@claude @codex @agy @<helper> @all @user). Mentioned agents get the message \
+typed into their session, so only mention someone when you want them to act or answer.
+- `room log 50` shows recent history. `room spawn NAME claude|codex|agy` starts an extra helper agent \
+(names: lowercase, e.g. codex2); `room kill NAME` stops one when done.
+- Shared workspace (your cwd): {ws}. Before editing, agree on who owns which files.
+- Use your own subagents / parallel tools freely for big tasks.
+- Ask the human for permission as you normally would; never try to bypass approval prompts.
+{role}
+Right now: run `room log 40` to catch up on any earlier room context, then reply "ready" here in your own session (do not post to the room), then wait for room messages."""
+ROLES = {
+    "claude": "Your role: MANAGER/supervisor. Turn @user requests into concrete tasks with clear specs and "
+              "acceptance criteria, assign them to @codex, @agy, spawned helpers (spawn when parallel work "
+              "helps) or yourself. Track every task in TASKS.md (id, owner, status, notes) so the user can check "
+              "progress. Review results in the workspace, send fixes back, kill helpers you no longer need, and "
+              "report final results to @user. Any room message with no @mention comes to you.",
+}
+WORKER = ("Your role: WORKER. Do tasks assigned to you; you may coordinate directly with other workers. "
+          "When done or blocked, report with room say mentioning whoever assigned the task (usually @claude): "
+          "what you did, which files, open issues.")
+
+
+def api(path, data=None):
+    req = urllib.request.Request(ROOM + path, json.dumps(data).encode() if data is not None else None,
+                                 {"Content-Type": "application/json"})
+    return json.load(urllib.request.urlopen(req, timeout=10))
+
+
+def tmux(*args, check=False):
+    return subprocess.run(["tmux", *args], capture_output=True, text=True, env=ENV, check=check).stdout.strip()
+
+
+def agents():
+    """name -> (pane_id, kind, born, window)"""
+    out = tmux("list-panes", "-a", "-F", "#{session_name} #{pane_id} #{window_name} #{@agent} #{@kind} #{@born}")
+    r = {}
+    for line in out.splitlines():
+        s, pane, win, *rest = line.split()
+        if s == "room" and len(rest) == 3:
+            r[rest[0]] = (pane, rest[1], float(rest[2]), win)
+    return r
+
+
+def room_agents(sid=None):
+    sid = sid or api('/session')['id']
+    if not sid:
+        return {}
+    if not re.fullmatch(r'\d{8}-\d{6}', sid):
+        sys.exit('invalid room session id')
+    try:
+        with open(os.path.join(SESSIONS, sid, 'agents.json')) as f:
+            return {a['name']: a for a in json.load(f)}
+    except FileNotFoundError:
+        return {}
+
+
+def save_agent(record=None, remove=None):
+    sid = api('/session')['id']
+    if not sid:
+        return
+    path = os.path.join(SESSIONS, sid)
+    with open(os.path.join(path, '.agents.lock'), 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        roster = room_agents(sid)
+        if record:
+            roster[record['name']] = record
+        if remove:
+            roster.pop(remove, None)
+        temp = os.path.join(path, f'.agents-{os.getpid()}.tmp')
+        with open(temp, 'w') as f:
+            json.dump(list(roster.values()), f, indent=2)
+        os.replace(temp, os.path.join(path, 'agents.json'))
+
+
+def discover(record):
+    marker = 'Room launch: ' + record.get('launch_id', '')
+    if not record.get('launch_id'):
+        return None
+    born = record['born']
+    if record['kind'] == 'codex':
+        paths = glob.glob(f'{HOME}/.codex/sessions/*/*/*/rollout-*.jsonl')
+        for path in sorted(paths, key=os.path.getmtime, reverse=True):
+            if os.path.getmtime(path) < born - 5:
+                continue
+            try:
+                with open(path) as f:
+                    meta = json.loads(next(f))['payload']
+                    if meta.get('cwd') != WS or meta.get('source') != 'cli':
+                        continue
+                    if datetime.datetime.fromisoformat(meta['timestamp'].replace('Z', '+00:00')).timestamp() < born - 5:
+                        continue
+                    for _, line in zip(range(64), f):
+                        payload = json.loads(line).get('payload', {})
+                        if payload.get('role') == 'user' and any(marker in c.get('text', '') for c in payload.get('content', [])):
+                            return str(uuid.UUID(meta['id']))
+            except (OSError, ValueError, KeyError, StopIteration):
+                continue
+    elif record['kind'] == 'agy':
+        paths = glob.glob(f'{HOME}/.gemini/antigravity-cli/conversations/*.db')
+        for path in sorted(paths, key=os.path.getmtime, reverse=True):
+            if os.path.getmtime(path) < born - 5:
+                continue
+            try:
+                with contextlib.closing(sqlite3.connect('file:' + path + '?mode=ro', uri=True, timeout=0.1)) as db:
+                    step = db.execute('SELECT step_payload FROM steps ORDER BY idx LIMIT 1').fetchone()
+                    workspace = db.execute('SELECT data FROM trajectory_metadata_blob LIMIT 1').fetchone()
+                    # shortcut: match the embedded intro/URI in agy's protobuf blobs; use its API if the schema changes.
+                    if step and workspace and marker.encode() in step[0] and ('file://' + WS).encode() in workspace[0]:
+                        return str(uuid.UUID(os.path.basename(path)[:-3]))
+            except (OSError, sqlite3.Error, ValueError, TypeError):
+                continue
+    return None
+
+
+def record_conversations(live):
+    try:
+        roster = room_agents()
+    except (OSError, ValueError) as e:
+        print(f'could not read conversation records: {e}')
+        return
+    for name, record in roster.items():
+        if name not in live or record.get('conversation_id') or time.time() - record.get('born', 0) > 300:
+            continue
+        try:
+            conversation = discover(record)
+            if conversation:
+                save_agent({**record, 'conversation_id': conversation})
+        except (OSError, ValueError) as e:
+            print(f'could not record {name} conversation: {e}')
+
+
+def claude_session_exists(conversation):
+    """claude pins --session-id before the transcript exists; a respawn must not --resume one that was never written (crash during setup)."""
+    proj = re.sub(r'[^a-zA-Z0-9]', '-', WS)
+    return os.path.exists(os.path.join(HOME, '.claude', 'projects', proj, conversation + '.jsonl'))
+
+
+def load_preferences():
+    try:
+        with open(os.path.join(DIR, 'data', 'preferences.json')) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def agent_settings(name, kind, record=None):
+    preferences = load_preferences()
+    for key in (name, kind):
+        saved = preferences.get(key)
+        if saved and saved['kind'] == kind:
+            return saved['model'], saved['effort']
+    cfg = tmux("show-options", "-v", "-t", "room", f"@cfg-{name}")
+    if cfg:
+        return tuple((cfg.split() + [""])[:2])
+    if record and record['kind'] == kind:
+        return record['model'], record['effort']
+    return DEFAULTS[kind]
+
+
+def ensure_trust(kind):
+    """Pre-trust the workspace so a CLI doesn't prompt on launch (auto-answer stays as the fallback).
+    claude uses IS_SANDBOX=1 in its pane env instead of a config entry."""
+    try:
+        if kind == "codex":
+            path = os.path.join(HOME, ".codex", "config.toml")
+            block = f'[projects."{WS}"]'
+            text = open(path).read() if os.path.exists(path) else ""
+            if block not in text:
+                with open(path, "a") as f:
+                    f.write(f'\n{block}\ntrust_level = "trusted"\n')
+        elif kind == "agy":
+            path = os.path.join(HOME, ".gemini", "antigravity-cli", "settings.json")
+            if os.path.exists(path):
+                d = json.load(open(path))
+                tw = d.setdefault("trustedWorkspaces", [])
+                if isinstance(tw, list) and WS not in tw:
+                    tw.append(WS)
+                    temp = path + f".{os.getpid()}.tmp"
+                    json.dump(d, open(temp, "w"), indent=2)
+                    os.replace(temp, path)
+    except (OSError, ValueError) as e:
+        print(f"ensure_trust({kind}): {e}")
+
+
+def spawn(name, kind, window=None, record=None):
+    if not re.fullmatch(r"[a-z][a-z0-9_-]{0,15}", name) or kind not in DEFAULTS or name in ("user", "all", "room"):
+        sys.exit("usage: room spawn NAME claude|codex|agy [MODEL [EFFORT]]   (NAME lowercase, not user/all/room)")
+    if name in agents():
+        return print(f"{name} is already running")
+    record = record or room_agents().get(name)
+    if record and record['kind'] != kind:
+        record = None
+    model, effort = agent_settings(name, kind, record)
+    conversation = record.get('conversation_id', '') if record else ''
+    resume = bool(conversation)
+    if resume and kind == 'claude' and not claude_session_exists(conversation):
+        resume = False  # session-id was pinned but never persisted; start fresh, reusing the id
+    if kind == 'claude' and not conversation:
+        conversation = str(uuid.uuid4())
+    born, launch_id = time.time(), str(uuid.uuid4())
+    if resume:
+        prompt = f'You are @{name}, resumed into the agent room. Continue using room say to talk to the team. Run room log 40 for the current room context, then wait for new room messages.'
+    else:
+        prompt = INTRO.format(name=name, kind=kind, ws=WS, role=ROLES.get(name, WORKER)) + f'\nRoom launch: {launch_id}'
+    ensure_trust(kind)
+    cmd = cli(kind, model, effort, conversation, resume) + ' ' + shlex.quote(prompt)
+    opts = ["-c", WS, "-e", f"ROOM_NAME={name}"] + (["-e", "IS_SANDBOX=1"] if kind == "claude" else []) + ["-P", "-F", "#{pane_id}"]
+    if window:
+        pane = tmux("split-window", "-t", window, *opts, cmd)
+        tmux("select-layout", "-t", window, "tiled")
+    else:
+        pane = tmux("new-window", "-d", "-t", "room:", "-n", name, *opts, cmd)
+    if not pane:
+        raise RuntimeError(f'could not start {name}')
+    for k, v in (("@agent", name), ("@kind", kind), ("@born", str(born)), ("@model", f"{model} {effort}")):
+        tmux("set-option", "-p", "-t", pane, k, v)
+    save_agent({'name': name, 'kind': kind, 'model': model, 'effort': effort,
+                'conversation_id': conversation, 'born': born, 'launch_id': launch_id})
+    print(f"spawned {name} ({kind}, {model} {effort})" + (' [resumed]' if resume else ' [fresh]'))
+
+
+def set_model(name, kind, model, effort=None):
+    if not re.fullmatch(r"[a-z][a-z0-9_-]{0,15}", name) or kind not in DEFAULTS or name in ("user", "all", "room"):
+        sys.exit("invalid agent name or kind")
+    path = os.path.join(DIR, 'data', 'preferences.json')
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(os.path.join(DIR, 'data', '.preferences.lock'), 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if effort is None:
+            effort = agent_settings(name, kind, room_agents().get(name))[1]
+        if not all(re.fullmatch(r"[\w.:-]+", x) for x in (model, effort or "x")):
+            sys.exit("bad model or effort name")
+        preferences = load_preferences()
+        preferences[name] = {'kind': kind, 'model': model, 'effort': effort}
+        temp = path + f'.{os.getpid()}.tmp'
+        with open(temp, 'w') as f:
+            json.dump(preferences, f, indent=2)
+        os.replace(temp, path)
+    tmux("set-option", "-t", "room", f"@cfg-{name}", f"{model} {effort}".strip())
+    # shortcut: native CLI /effort changes bypass room bookkeeping; use /model NAME MODEL EFFORT for durable choices.
+    return model, effort
+
+
+EFFORTS = {"claude": ["low", "medium", "high", "xhigh", "max"],
+           "codex": ["low", "medium", "high", "xhigh", "max", "ultra"],
+           "agy": ["low", "medium", "high", "xhigh", "max"]}
+COMMANDS = [  # shown in the browser / terminal autocomplete
+    {"cmd": "/who", "args": "", "desc": "list agents and their models"},
+    {"cmd": "/models", "args": "", "desc": "list the models each CLI offers"},
+    {"cmd": "/model", "args": "NAME MODEL [EFFORT]", "desc": "restart an agent on another model"},
+    {"cmd": "/spawn", "args": "NAME KIND [MODEL [EFFORT]]", "desc": "add a helper agent"},
+    {"cmd": "/kill", "args": "NAME", "desc": "stop an agent"},
+    {"cmd": "/approve", "args": "NAME [N]", "desc": "answer a permission prompt with option N"},
+    {"cmd": "/deny", "args": "NAME", "desc": "reject a permission prompt"},
+    {"cmd": "/send", "args": "NAME TEXT...", "desc": "send text or a CLI slash command to an agent"},
+    {"cmd": "/key", "args": "NAME KEY...", "desc": "send keys to an agent's picker/menu"},
+    {"cmd": "/peek", "args": "NAME [N]", "desc": "show an agent's screen (default 30 lines, max 120)"},
+    {"cmd": "/auto", "args": "on|off", "desc": "let claude answer the other agents' permission prompts"},
+    {"cmd": "/clear", "args": "", "desc": "archive and wipe the chat"},
+    {"cmd": "/fresh", "args": "", "desc": "wipe the chat and restart every agent"},
+    {"cmd": "/sessions", "args": "", "desc": "list saved room sessions"},
+    {"cmd": "/resume", "args": "ID", "desc": "restore a room session and its CLI conversations"},
+    {"cmd": "/new", "args": "", "desc": "start a fresh room session"},
+]
+
+
+# each CLI's own slash commands, for /send NAME /cmd autocomplete (ponytail: hand-kept list; extend as the CLIs add more)
+NATIVE = {
+    "claude": [
+        "/add-dir", "/advisor", "/agents", "/artifacts", "/clear", "/code-review",
+        "/compact", "/config", "/context", "/cost", "/diff", "/effort", "/exit",
+        "/export", "/fast", "/fork", "/help", "/init", "/keybindings", "/mcp",
+        "/memory", "/model", "/permissions", "/plan", "/recap", "/resume",
+        "/review", "/skills", "/status", "/tasks", "/ultrareview", "/usage",
+    ],
+    "codex": [
+        "/agents", "/app", "/approve", "/archive", "/cd", "/clear", "/compact",
+        "/copy", "/daemon", "/delete", "/diff", "/experimental", "/export",
+        "/fast", "/feedback", "/fork", "/goal", "/hooks", "/ide", "/import",
+        "/init", "/keymap", "/logout", "/mcp", "/memories", "/mention", "/model",
+        "/new", "/permissions", "/pets", "/plan", "/plugins", "/ps", "/pwd",
+        "/raw", "/recap", "/rename", "/resume", "/review", "/side", "/skills",
+        "/status", "/statusline", "/stop", "/subagents", "/theme", "/title",
+        "/tui", "/usage", "/vim", "/voice", "/warnings", "/worktree",
+    ],
+    "agy": [
+        "/add-dir", "/agents", "/agy-customizations", "/antigravity-guide",
+        "/artifact", "/browser", "/btw", "/changelog", "/clear", "/codesearch",
+        "/config", "/context", "/copy", "/credits", "/diff", "/effort", "/exit",
+        "/feedback", "/fork", "/goal", "/grill-me", "/help", "/hooks",
+        "/keybindings", "/learn", "/logout", "/mcp", "/model", "/open",
+        "/permissions", "/plan", "/plugin", "/remote-control", "/rename",
+        "/resume", "/rewind", "/schedule", "/skills", "/statusline", "/tasks",
+        "/title", "/usage", "/voice",
+    ],
+}
+
+
+def model_lists():
+    r = {"claude": ["opus", "sonnet", "haiku", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5",
+                    "claude-fable-5-1"], "codex": [], "agy": []}
+    try:
+        r["codex"] = [m["slug"] for m in json.load(open(f"{HOME}/.codex/models_cache.json"))["models"]]
+    except Exception:
+        pass
+    out = subprocess.run(["agy", "models"], capture_output=True, text=True).stdout
+    r["agy"] = [l.split()[0] for l in out.splitlines() if l.strip() and not l.startswith("Fetching")]
+    return r
+
+
+def models():
+    for kind, names in model_lists().items():
+        print(f"{kind}: {', '.join(names) or '(unknown)'}\n    effort: {' '.join(EFFORTS[kind])}")
+
+
+def kill(name, forget=True):
+    a = agents().get(name)
+    if not a:
+        return print(f"no agent named {name}")
+    tmux("kill-pane", "-t", a[0])
+    if forget:
+        save_agent(remove=name)
+    print(f"killed {name}" + (" (core agent: the router will restart it)" if name in CORE else ""))
+
+
+def switch_room(sid=None, fresh=False):
+    live = agents()
+    record_conversations(live)
+    if sid:
+        if sid not in {s['id'] for s in api('/sessions')['sessions']}:
+            sys.exit('no such room session')
+        roster = room_agents(sid)
+    elif fresh:
+        roster = room_agents()
+    else:
+        roster = {}
+    if not roster:
+        roster = {}
+        for name in CORE:
+            model, effort = agent_settings(name, name)
+            roster[name] = {'name': name, 'kind': name, 'model': model, 'effort': effort, 'conversation_id': ''}
+    for r in roster.values():
+        if not re.fullmatch(r'[a-z][a-z0-9_-]{0,15}', r['name']) or r['name'] in ('user', 'all', 'room') or r['kind'] not in DEFAULTS:
+            sys.exit('invalid agent in saved session')
+        if not all(re.fullmatch(r'[\w.:-]+', v) for v in (r['model'], r['effort'] or 'x')):
+            sys.exit('invalid model or effort in saved session')
+        if r.get('conversation_id'):
+            try:
+                uuid.UUID(r['conversation_id'])
+            except ValueError:
+                sys.exit('invalid CLI conversation id in saved session')
+    try:
+        if fresh:
+            api('/clear', {'from': 'room', 'text': '--- chat cleared; fresh CLI conversations in the same room session ---'})
+        else:
+            api('/sessions/resume' if sid else '/sessions/new', {'id': sid} if sid else {})
+    except urllib.error.HTTPError as e:
+        sys.exit('could not switch room session: ' + e.read().decode())
+    for name in live:
+        kill(name, forget=False)
+    for r in roster.values():
+        if fresh:
+            r = {**r, 'conversation_id': '', 'launch_id': ''}
+            save_agent(r)
+        spawn(r['name'], r['kind'], window='room:team' if r['name'] in CORE else None, record=r)
+    print('fresh CLI conversations in the current room session' if fresh else f"room session {api('/session')['id']}")
+
+
+def up():
+    docker = lambda *a: subprocess.run(["docker", *a], capture_output=True, text=True)
+    # rebuild (cached, fast) and replace the server when it isn't running or runs an older server.py/index.html
+    image = subprocess.run(["docker", "build", "-q", "-t", "agent-room", DIR], check=True, capture_output=True, text=True).stdout.strip()
+    running = docker("inspect", "-f", "{{.State.Running}} {{.Image}}", "agent-room").stdout.split()
+    if running != ["true", image]:
+        print("starting chat server (docker)...")
+        docker("rm", "-f", "agent-room")
+        r = docker("run", "-d", "--name", "agent-room", "-p", "127.0.0.1:9090:8765",
+                   "-v", f"{DIR}/data:/data", "agent-room")
+        if r.returncode:
+            sys.exit(r.stderr)
+    for _ in range(60):
+        try:
+            api("/messages?since=999999999")
+            break
+        except Exception:
+            time.sleep(0.5)
+    else:
+        sys.exit("room server did not come up (docker logs agent-room)")
+    if subprocess.run(["tmux", "has-session", "-t", "room"], capture_output=True).returncode:
+        api('/sessions/new', {})
+        tmux("new-session", "-d", "-s", "room", "-n", "team", "-c", WS, "-x", "240", "-y", "60",
+             "-e", "ROOM_MAIN=1", "room chat")
+        tmux("new-window", "-d", "-t", "room:", "-n", "router", "room router")
+        print("started tmux session 'room' (core agents are coming up)")
+    else:
+        print("already running")
+    print("chat: this terminal, or http://localhost:9090 in a browser")
+
+
+def down():
+    subprocess.run(["docker", "rm", "-f", "agent-room"], capture_output=True)
+    print("stopped chat server and all agents")
+    tmux("kill-session", "-t", "room")  # last: this may kill our own pane
+
+
+CHAT_CMDS = ("who", "models", "model", "spawn", "kill", "clear", "fresh", "approve", "deny", "send", "key", "peek", "sessions", "resume", "new")
+KEYS = ("Escape", "Enter", "Up", "Down", "Left", "Right", "Tab", "BTab", "C-c", "y", "n", *"123456789")
+
+
+def last_lines(pane, n=10):
+    return "\n".join([l for l in tmux("capture-pane", "-p", "-t", pane).splitlines() if l.strip()][-n:])
+
+
+OPTION = re.compile(r"^\s*[❯›>]?\s*(\d+)\.\s+(.+?)\s*$", re.M)
+
+
+def option_keys(screen, choice):
+    options = [int(n) for n, _ in OPTION.findall(screen)]
+    if not options:
+        return ["Enter"] if choice == 1 else None
+    if choice not in options:
+        return None
+    selected = re.search(r"^\s*[❯›>]\s*(\d+)\.\s", screen, re.M)
+    # shortcut: an unmarked menu is assumed to select its first option; revisit if a CLI hides its cursor.
+    current = int(selected[1]) if selected else options[0]
+    if current not in options:
+        return None
+    steps = options.index(choice) - options.index(current)
+    return ["Down" if steps > 0 else "Up"] * abs(steps) + ["Enter"]
+
+
+# startup dialogs the router answers itself so no agent ever sits on them: (title, labels, pick).
+# Claude and agy hide option numbers, so options are matched by label and reached with arrow keys.
+# Picks are the safe "continue" choice (never enable new MCP servers / hooks / API keys).
+STARTUP = [
+    ("Is this a project you created or one you trust", ["No, exit", "No, continue without these permissions", "Yes, I trust this folder"], "Yes, I trust this folder"),
+    ("Do you trust the contents of this project", ["Yes, I trust this folder", "No, exit"], "Yes, I trust this folder"),
+    ("Bypass Permissions mode", ["No, exit", "Yes, I accept"], "Yes, I accept"),
+    ("Trust this folder?", ["Trust and continue", "Open restricted", "Quit"], "Trust and continue|Open restricted"),
+    ("Update available!", ["Update now", "Skip until next version", "Skip"], "Skip until next version"),
+    ("Hooks need review", ["Trust all and continue", "Continue without trusting"], "Continue without trusting"),
+    ("Working directory", ["Use session directory", "Use current directory", "Always use current directory"], "Use current directory"),
+    ("MCP server", ["Use this MCP server", "Use this and all future MCP servers in this project", "Continue without using this MCP server"], "Continue without using this MCP server"),
+    ("Allow external CLAUDE.md file imports?", ["Yes, allow external imports", "No, disable external imports"], "No, disable external imports"),
+    ("Do you want to use this API key?", ["Yes", "No (recommended)"], "No (recommended)"),
+    ("Claude in Chrome extension detected", ["Yes, use my browser", "No, keep browser tools off"], "No, keep browser tools off"),
+]
+
+
+def menu_keys(screen, labels, pick):
+    """Arrow keys + Enter that move the menu cursor (❯/›/>) onto the first label in pick ("a|b")."""
+    rows = []
+    for line in screen.splitlines():
+        text = re.sub(r"^\s*[❯›>]?\s*(?:\d+\.\s*)?", "", line).strip()
+        label = max((l for l in labels if text.startswith(l)), key=len, default=None)
+        if label:
+            rows.append((label, bool(re.match(r"\s*[❯›>]", line))))
+    names = [label for label, _ in rows]
+    target = next((names.index(t) for t in pick.split("|") if t in names), None)
+    if target is None or len(rows) < 2 or not any(on for _, on in rows):  # need a live menu cursor, not just prose
+        return None
+    current = next((i for i, (_, on) in enumerate(rows) if on), 0)
+    steps = target - current
+    return ["Down" if steps > 0 else "Up"] * abs(steps) + ["Enter"]
+
+
+def setup_nag(screen):
+    """(keys, what) for a startup dialog the router answers itself, else None."""
+    for title, labels, pick in STARTUP:
+        if title in screen:
+            keys = menu_keys(screen, labels, pick)
+            if keys:
+                return keys, f"{title.rstrip('?:')} → {pick.split('|')[0]}"
+    options = OPTION.findall(screen)
+    labels = {label.lower().replace("’", "'") for _, label in options}
+    wizard = "Also scan shell history" in screen and "Also scan your other repos" in screen
+    if not (SETUP_NAG.search(screen) or {"not now", "don't show again"} <= labels or wizard):
+        return None
+    for n, label in options:
+        if label.lower().replace("’", "'") == "don't show again":
+            keys = option_keys(screen, int(n))
+            return (keys, "dismissed auto-mode setup (Don't show again)") if keys else None
+    if wizard and DIALOG.search(screen):
+        return ["Escape"], "cancelled auto-mode setup"
+    return None
+
+
+def answer(name, choice):
+    """choice: option number (as shown in the prompt) or 'n' to deny. Only acts while a prompt is open."""
+    a = agents().get(name)
+    screen = last_lines(a[0]) if a else ""
+    if not a or not DIALOG.search(screen):
+        return f"{name} has no open permission prompt"
+    if choice == "n":
+        tmux("send-keys", "-t", a[0], "Escape")
+    else:
+        keys = option_keys(screen, int(choice))
+        if keys is None:
+            return f"{name} has no option {choice}; answer in its pane or deny to cancel"
+        tmux("send-keys", "-t", a[0], *keys)
+    api("/messages", {"from": "room", "text": f"{ME} answered {name}'s prompt: "
+                      + ("deny" if choice == "n" else f"option {choice}")})
+    return "ok"
+
+
+def alert(asking):
+    """Make waiting permission prompts hard to miss: tmux status bar + desktop notification."""
+    if not asking:
+        return tmux("set-option", "-u", "-t", "room", "status-right")
+    text = "🔐 waiting for approval: " + ", ".join(asking) + "  (type y in the chat)"
+    tmux("set-option", "-t", "room", "status-right", "#[bg=red,fg=white,bold] " + text + " ")
+    tmux("set-option", "-t", "room", "status-right-length", "120")
+    try:
+        subprocess.run(["notify-send", "-u", "critical", "Agent room", text], env=ENV, timeout=5)
+    except Exception:
+        pass  # no desktop session; the chat + tmux bar still show it
+
+
+def router_state(sid, state=None):
+    if not isinstance(sid, str) or not re.fullmatch(r'\d{8}-\d{6}', sid):
+        raise ValueError('invalid room session id')
+    path = os.path.join(SESSIONS, sid, 'router.json')
+    if state is None:
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return {}
+    temp = path + f'.{os.getpid()}.tmp'
+    with open(temp, 'w') as f:
+        json.dump(state, f)
+    os.replace(temp, path)
+
+
+def router():
+    active = api('/session')['id']
+    saved = router_state(active)
+    seen = saved.get('seen', max([m["id"] for m in api("/messages")] or [0]))
+    pending = saved.get('pending', [])
+    respawned, warned, asking = {}, False, {}  # asking: agent -> (pane, prompt), oldest first
+    all_models, published, published_at = model_lists(), None, 0
+    discovered_at, sessions_at, all_sessions = 0, 0, []
+    nagged = {}  # agent -> (startup dialog, attempts): stops a dialog that won't close from looping
+    auto_manager = False  # "/auto on" in the chat lets claude answer the workers' permission prompts
+    # catch-up: each agent also gets the conversation it missed since its last delivery (e.g. a later @all)
+    history = [m for m in api("/messages") if m["from"] != "room" and not m.get("replay") and m["id"] <= seen][-CATCHUP:]
+    cursor = saved.get('cursor', {name: seen for name in agents()})  # advanced only after paste + Enter succeed
+
+    def checkpoint():
+        router_state(active, {'seen': seen, 'pending': pending, 'cursor': cursor})
+
+    print("router up, after message #%d" % seen)
+    while True:
+        try:
+            current = api('/session')['id']
+            if current != active:
+                pending.clear(); asking.clear(); respawned.clear(); history.clear(); cursor.clear()
+                active, published, sessions_at, auto_manager = current, None, 0, False
+                checkpoint()
+                alert(asking)
+            live = agents()
+            for name in CORE:  # keep the core team alive
+                if name not in live and time.time() - respawned.get(name, 0) > 20:  # backoff for crash loops
+                    respawned[name] = time.time()
+                    print("starting", name)
+                    spawn(name, name, window="room:team")
+            if time.time() - discovered_at > 5:
+                record_conversations(live)
+                discovered_at = time.time()
+            for name, (pane, kind, born, _) in live.items():  # surface permission prompts in the chat
+                screen = last_lines(pane)
+                nag = setup_nag(screen)
+                if nag:
+                    keys, action = nag
+                    tries = nagged.get(name, (None, 0))
+                    tries = ((pane, action), tries[1] + 1 if tries[0] == (pane, action) else 1)  # changing dialog text must not reset retries
+                    nagged[name] = tries
+                    if tries[1] > 3:  # the keys didn't close it: hand it to the user once, then stop retrying
+                        if tries[1] == 4:
+                            api("/messages", {"from": "room", "text": f"⚠️ {name} is stuck on a startup dialog ({action}). "
+                                 f"See it with /peek {name}, answer with /key {name} Down|Up|Enter"})
+                        continue
+                    tmux("send-keys", "-t", pane, *keys)
+                    api("/messages", {"from": "room", "text": f"✅ {name}: auto-answered startup dialog: {action}"})
+                    time.sleep(1)  # let the dialog close before the next scan
+                    if name in asking:
+                        del asking[name]
+                        alert(asking)
+                    continue
+                nagged.pop(name, None)
+                if time.time() - born > WARMUP and DIALOG.search(screen):
+                    body = "\n".join(l for l in screen.splitlines() if not re.fullmatch(r"[\s─╌━-]+", l))
+                    prompt = (pane, re.sub(r"(?m)^[ \t]*[❯›>]?[ \t]*(?=\d+\.)", "", body))
+                    if asking.get(name) != prompt:
+                        if name in asking:
+                            api("/messages", {"from": "room", "text": f"✅ {name}: previous dialog replaced; see updated request below"})
+                        asking[name] = prompt
+                        opts = OPTION.findall(screen)
+                        menu = "\n".join(f"   {n} = {t}" for n, t in opts) or "   1 = yes"
+                        api("/messages", {"from": "room", "text": f"🔐 {name} needs your approval:\n{body}\n\n"
+                             f"→ type a number to choose:\n{menu}\n   n = deny\n"
+                             f"  (y = 1.  With several waiting, add the name: 2 {name})"})
+                        alert(asking)
+                        if name != "claude" and auto_manager and "claude" in live:
+                            pending.append(("claude", None, f"[room] permission request from {name}:\n{body}\n"
+                                f"You're the manager: if it's safe and within the task, approve it with "
+                                f"`room approve {name} N` (N = option number; prefer the 'always allow' option "
+                                f"for harmless repeated commands). Deny with `room deny {name}` and tell @user if "
+                                f"it's destructive, touches secrets, or is outside the task. If unsure, leave it "
+                                f"for @user."))
+                elif name in asking:
+                    del asking[name]
+                    api("/messages", {"from": "room", "text": f"✅ {name}: permission answered, back to work"})
+                    alert(asking)
+            for name in [n for n in asking if n not in live]:
+                del asking[name]
+                alert(asking)
+            if time.time() - sessions_at > 10:
+                all_sessions = api('/sessions')['sessions']
+                sessions_at = time.time()
+            st = {"agents": [{"name": n, "kind": k, "asking": n in asking,
+                              "model": tmux("show-options", "-p", "-v", "-t", p, "@model")}
+                             for n, (p, k, _, _) in sorted(live.items())],
+                  "models": all_models, "efforts": EFFORTS, "commands": COMMANDS, "native": NATIVE, "sessions": all_sessions, "session": active}
+            # agents/models/commands for the browser + terminal autocomplete; resent every 10s so a
+            # restarted server is never left empty
+            if st != published or time.time() - published_at > 10:
+                api("/state", st)
+                published, published_at = st, time.time()
+            msgs = api(f"/messages?since={seen}")
+            for m in msgs:
+                seen = m["id"]
+                if m.get('replay'):
+                    continue  # restored history is for readers; never replay old commands into agents
+                if m.get('reset'):
+                    pending.clear(); asking.clear(); respawned.clear(); history.clear(); cursor.clear()
+                    alert(asking)
+                if m["from"] == "room":  # notices are for humans; never deliver them to agents
+                    continue
+                if m["from"] == "user":
+                    warned = False
+                    # y / n (optionally + agent name) answers a waiting permission prompt
+                    cmd = m["text"].lower().split()
+                    if cmd[:1] == ["/auto"] and len(cmd) == 2:
+                        auto_manager = cmd[1] == "on"
+                        api("/messages", {"from": "room", "text": "claude " + ("may now answer" if auto_manager
+                             else "will no longer answer") + " the other agents' permission prompts"})
+                        continue
+                    if cmd and cmd[0][0] == "/" and cmd[0][1:] in CHAT_CMDS:
+                        checkpoint()  # never replay a CLI command if the router dies while running it
+                        out = io.StringIO()
+                        with contextlib.redirect_stdout(out):
+                            failed = False
+                            try:
+                                args = m["text"].split(None, 2)[1:] if cmd[0] == "/send" else m["text"].split()[1:]
+                                main([cmd[0][1:]] + args)
+                            except (SystemExit, RuntimeError) as e:
+                                failed = True
+                                print(e)
+                        api("/messages", {"from": "room", "text": f"{m['text']}\n{out.getvalue().strip()}"})
+                        if not failed and cmd[0] in ('/new', '/resume', '/clear', '/fresh'):
+                            pending.clear(); asking.clear(); respawned.clear(); history.clear(); cursor.clear()
+                            published, sessions_at = None, 0
+                            alert(asking)
+                            break  # discard the old polling batch after changing or clearing its session
+                        continue
+                    if cmd and (cmd[0] in ("y", "yes", "n", "no") or cmd[0].isdigit()) and len(cmd) <= 2 and asking:
+                        who = cmd[1] if len(cmd) == 2 else next(iter(asking))
+                        if who in asking:
+                            choice = "n" if cmd[0][0] == "n" else ("1" if cmd[0][0] == "y" else cmd[0])
+                            result = answer(who, choice)
+                            print(result)
+                            if result != "ok":
+                                api("/messages", {"from": "room", "text": result})
+                            continue
+                history.append(m)
+                del history[:-CATCHUP - 1]  # +1: the message being delivered is in history too
+                tags = set(re.findall(r"@([\w-]+)", m["text"].lower()))
+                names = [a for a in live if tags & {"all", "everyone"} or a in tags]
+                if not names:  # un-addressed messages go to the manager
+                    names = ["claude"]
+                if m["from"] != "user" and names:
+                    hist = api(f"/messages?since={max(0, seen - MAX_AGENT_HOPS)}")
+                    if len(hist) >= MAX_AGENT_HOPS and all(h["from"] != "user" for h in hist):
+                        if not warned:
+                            warned = True
+                            api("/messages", {"from": "room", "text": f"Paused agent-to-agent delivery after "
+                                 f"{MAX_AGENT_HOPS} messages without @user. Post anything to resume."})
+                        continue
+                for a in names:
+                    if a == m["from"]:
+                        continue
+                    queued = max([cursor.get(a, 0)] + [mid for name, mid, _ in pending if name == a and mid is not None])
+                    missed = [h for h in history if queued < h["id"] < m["id"] and h["from"] != a]
+                    catchup = "".join(f"#{h['id']} {h['from']}: {h['text'][:CATCHUP_CHARS]}"
+                                      + (f"…[cut; room log {CATCHUP + 1}]" if len(h['text']) > CATCHUP_CHARS else "")
+                                      + "\n" for h in missed)
+                    if catchup:
+                        catchup = f"[room catch-up: {len(missed)} message(s) you missed]\n{catchup}[end catch-up]\n"
+                    pending.append((a, m['id'], f"{catchup}[room #{m['id']}] {m['from']}: {m['text']}\n(answer with: room say ...)"))
+            if msgs:
+                checkpoint()
+            live = agents()
+            for item in list(pending):
+                name, mid, text = item
+                if name not in live:
+                    if name not in CORE:
+                        pending.remove(item)  # helper is gone; drop its mail
+                        checkpoint()
+                    continue
+                pane, kind, born, _ = live[name]
+                screen = last_lines(pane)
+                if time.time() - born < WARMUP or DIALOG.search(screen) or setup_nag(screen):
+                    continue
+                # bracketed paste keeps multi-line messages as one input, then Enter submits it
+                subprocess.run(["tmux", "load-buffer", "-b", "room", "-"], input=text, text=True, check=True)
+                tmux("paste-buffer", "-p", "-d", "-b", "room", "-t", pane, check=True)
+                time.sleep(0.5)
+                tmux("send-keys", "-t", pane, "Enter", check=True)
+                if mid is not None:
+                    cursor[name] = mid
+                pending.remove(item)
+                # shortcut: a crash after Enter but before this save can duplicate a delivery; add agent acknowledgments if needed.
+                checkpoint()
+                print("delivered to", name, text[:80].replace("\n", " "))
+        except Exception as e:
+            print("error:", e)
+            time.sleep(3)
+        time.sleep(1)
+
+
+def fmt(m):
+    t = time.strftime("%H:%M:%S", time.localtime(m["ts"]))
+    return f"\033[2m#{m['id']} {t}\033[0m \033[1;{COLORS.get(m['from'], 36)}m{m['from']}\033[0m: {m['text']}"
+
+
+def chat():
+    import readline
+    signal.signal(signal.SIGHUP, signal.default_int_handler)  # closing the terminal acts like Ctrl-C
+    prompt = f"\033[1;{COLORS.get(ME, 36)}m{ME}>\033[0m "
+
+    def show(text):  # print above the input line without clobbering what's being typed
+        sys.stdout.write("\r\033[K" + text + "\n" + prompt + readline.get_line_buffer())
+        sys.stdout.flush()
+
+    def watch(last):
+        while True:
+            try:
+                for m in api(f"/messages?since={last}"):
+                    last = m["id"]
+                    if m["from"] == "room" and m["text"].startswith("🔐"):
+                        show("\a\033[1;30;43m" + m["text"].replace("\n", "\033[K\n") + "\033[K\033[0m")
+                    else:
+                        show(fmt(m))
+            except Exception as e:
+                show(f"\033[31m(room unreachable: {e})\033[0m")
+                time.sleep(3)
+            time.sleep(1)
+
+    if os.environ.get("ROOM_MAIN"):
+        print("Ctrl-C here stops everything. Agents' own sessions: tmux attach -t room (another terminal).")
+    print("Agent room. No @mention = goes to @claude (manager). Permission requests: type the option number, y (=1) or n.\n"
+          "Commands: /who  /models  /model NAME MODEL [EFFORT]  /spawn NAME KIND [MODEL [EFFORT]]  /kill NAME\n"
+          "          /auto on|off (let claude answer others' prompts; off by default)  /clear  /fresh  /log N\n"
+          "          /send NAME TEXT...  /key NAME KEY...  /peek NAME [N]  /sessions  /resume ID  /new")
+    def complete(text, i):  # Tab completion for @names, /commands and their arguments
+        try:
+            st = api("/state")
+        except Exception:
+            return None
+        names = {a["name"]: a["kind"] for a in st.get("agents", [])}
+        words = readline.get_line_buffer()[:readline.get_endidx()].split()
+        if text and words and words[-1] == text:
+            words = words[:-1]  # only the words before the one being completed
+        if text.startswith("@"):
+            opts = ["@" + n for n in [*names, "all"]]
+        elif not words:
+            opts = [c["cmd"] for c in st.get("commands", [])] + ["/log", "/quit"]
+        else:
+            cmd, n = words[0], len(words)
+            kind = names.get(words[1]) if cmd == "/model" and n >= 2 else (words[2] if n >= 3 else None)
+            opts = {
+                ("/model", 1): list(names), ("/kill", 1): list(names), ("/approve", 1): list(names),
+                ("/deny", 1): list(names), ("/auto", 1): ["on", "off"], ("/spawn", 2): ["claude", "codex", "agy"],
+                ("/send", 1): list(names), ("/key", 1): list(names), ("/peek", 1): list(names),
+                ("/resume", 1): [s['id'] for s in st.get('sessions', [])],
+                ("/model", 2): st.get("models", {}).get(kind, []), ("/model", 3): st.get("efforts", {}).get(kind, []),
+                ("/spawn", 3): st.get("models", {}).get(kind, []), ("/spawn", 4): st.get("efforts", {}).get(kind, []),
+                ("/send", 2): st.get("native", {}).get(names.get(words[1]), []) if n >= 2 else [],
+            }.get((cmd, n), KEYS if cmd == "/key" and n >= 2 else [])
+        matches = [o + " " for o in opts if o.startswith(text)]
+        return matches[i] if i < len(matches) else None
+
+    readline.set_completer_delims(" \t\n")
+    readline.set_completer(complete)
+    readline.parse_and_bind("tab: complete")
+    history = api("/messages")
+    threading.Thread(target=watch, args=(history[-20]["id"] - 1 if len(history) > 20 else 0,), daemon=True).start()
+    while True:
+        try:
+            line = input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if line == "/quit":
+            break
+        if line.startswith("/log"):
+            main(line[1:].split())
+        elif line:  # "/" commands go through the room too: the router runs them, everyone sees the result
+            api("/messages", {"from": ME, "text": line})
+    if os.environ.get("ROOM_MAIN"):
+        down()
+
+
+def main(argv):
+    cmd, args = (argv[0], argv[1:]) if argv else ("attach", [])
+    if cmd == "attach":
+        up()
+        os.execvpe("tmux", ["tmux", "attach", "-t", "room"], ENV)
+    elif cmd == "up":
+        up()
+    elif cmd == "down":
+        down()
+    elif cmd == "chat":
+        chat()
+    elif cmd == "say":
+        text = " ".join(args) if args else sys.stdin.read()
+        print("posted #%d" % api("/messages", {"from": ME, "text": text.strip()})["id"])
+    elif cmd == "log":
+        for m in api("/messages")[-int(args[0] if args else 30):]:
+            print(fmt(m))
+    elif cmd == "who":
+        for name, (pane, kind, born, win) in sorted(agents().items()):
+            model = tmux("show-options", "-p", "-v", "-t", pane, "@model")
+            print(f"{name:10} {kind:7} {model:28} window={win:8} up {int(time.time() - born) // 60}m")
+    elif cmd in ("send", "key", "peek") and (len(args) in (1, 2) if cmd == "peek" else len(args) >= 2):
+        a = agents().get(args[0])
+        if not a:
+            sys.exit(f"no agent named {args[0]}")
+        if cmd == "send":
+            text = " ".join(args[1:])
+            if not text.strip():
+                sys.exit("usage: room send NAME TEXT...")
+            screen = last_lines(a[0])
+            if DIALOG.search(screen) or setup_nag(screen):
+                sys.exit(f"{args[0]} has an open dialog; answer it first")
+            subprocess.run(["tmux", "load-buffer", "-b", "room", "-"], input=text, text=True)
+            tmux("paste-buffer", "-p", "-d", "-b", "room", "-t", a[0])
+            time.sleep(0.5)
+            tmux("send-keys", "-t", a[0], "Enter")
+            print(f"sent to {args[0]}")
+            if text.startswith("/"):  # a CLI command: show what it printed
+                time.sleep(3)
+                print(last_lines(a[0], 25))
+        elif cmd == "key":
+            if any(key not in KEYS for key in args[1:]):
+                sys.exit("allowed keys: " + " ".join(KEYS))
+            tmux("send-keys", "-t", a[0], *args[1:])
+            print(f"sent keys to {args[0]}")
+        else:
+            if len(args) == 2 and (not re.fullmatch(r"[0-9]+", args[1]) or int(args[1]) < 1):
+                sys.exit("usage: room peek NAME [N] (N must be positive, max 120)")
+            n = min(int(args[1]) if len(args) == 2 else 30, 120)
+            print(last_lines(a[0], n))
+    elif cmd == "spawn" and 2 <= len(args) <= 4:
+        record = room_agents().get(args[0])
+        if len(args) > 2:
+            model, effort = set_model(args[0], args[1], *args[2:])
+            if record:
+                record = {**record, 'model': model, 'effort': effort}
+        spawn(*args[:2], record=record)
+    elif cmd == "model" and not args:  # bare /model: show what everyone runs and what's available
+        main(["who"])
+        print("\nswitch with: /model NAME MODEL [EFFORT]   (or use the dropdowns in the browser header)\n")
+        models()
+    elif cmd == "model" and 2 <= len(args) <= 3:
+        a = agents().get(args[0])
+        if not a:
+            sys.exit(f"no agent named {args[0]}")
+        model, effort = set_model(args[0], a[1], *args[1:])
+        record_conversations(agents())
+        record = room_agents().get(args[0])
+        if record:
+            record = {**record, 'model': model, 'effort': effort}
+        kill(args[0], forget=False)
+        spawn(args[0], a[1], window="room:team" if args[0] in CORE else None, record=record)
+    elif cmd == "models":
+        models()
+    elif cmd == 'sessions' and not args:
+        for s in api('/sessions')['sessions']:
+            print(f"{'*' if s['current'] else ' '} {s['id']}  {s['started']}  agents: {', '.join(s['agents']) or '-'}  messages: {s['messages']}  {s['title']}")
+    elif cmd == 'resume' and len(args) == 1 and args[0]:
+        switch_room(args[0])
+    elif cmd == 'new' and not args:
+        switch_room()
+    elif cmd == 'fresh' and not args:
+        switch_room(fresh=True)
+    elif cmd == "clear" and not args:
+        api("/clear", {"from": "room", "text": "--- chat history cleared ---"})
+        print("chat cleared (old history archived in the current session)")
+    elif cmd == "approve" and len(args) in (1, 2) and (len(args) == 1 or args[1].isdigit()):
+        print(answer(args[0], args[1] if len(args) == 2 else "1"))
+    elif cmd == "deny" and len(args) == 1:
+        print(answer(args[0], "n"))
+    elif cmd == "kill" and len(args) == 1:
+        kill(args[0])
+    elif cmd == "router":
+        router()
+    elif cmd == "intro" and len(args) == 2:
+        print(INTRO.format(name=args[0], kind=args[1], ws=WS, role=ROLES.get(args[0], WORKER)))
+    else:
+        usage = [l.strip() for l in __doc__.splitlines() if l.strip().startswith(f"room {cmd} ")]
+        sys.exit("usage: " + usage[0] if usage and argv is not sys.argv[1:] else __doc__)
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except RuntimeError as e:
+        sys.exit(str(e))
